@@ -126,7 +126,7 @@ req.end();
 
 #### 1. 連接階段
 
-當呼叫http.request函數發起請求之後，Node會建立與伺服器的socket連接，而socket連接是需要IP位址和通訊埠號的，所以中間還有一個DNS解析過程。http.request函數傳回的物件req代表了這次HTTP請求，其監聽的reqsponse事件在連接建立之後，伺服器的HTTP標頭資訊解析完畢之後觸發。此物件的建置函數原始程式位於*_http_client.js*，以下截留出關鍵的程式碼片段：
+當呼叫http.request函數發起請求之後，Node會建立與伺服器的socket連接，而socket連接是需要IP位址和通訊埠號的，所以中間還有一個DNS解析過程。http.request函數傳回的物件req代表了這次HTTP請求，其監聽的response事件在連接建立之後，伺服器的HTTP標頭資訊解析完畢之後觸發。此物件的建置函數原始程式位於*_http_client.js*，以下截留出關鍵的程式碼片段：
 
 ```js
 function ClientRequest(options, cb) {
@@ -180,7 +180,7 @@ process.nextTick(onSocketNT, this, socket);
 
 這表示在下一輪循環才執行onSocketNT()函數，這個函數執行會觸發socket事件。因為在呼叫_deferToConnect()函數的過程中，req監聽了此事件，而監聽這個事件的意義在於，在執行此事件的回呼函數時，讓newSocket物件監聽connect事件。
 
-這裡的重頭戲在createSocket()函數的呼叫上，這個函數實際上呼叫了net.js中定義的建置函數createCpnnection()，這個函數的定義如下所示：
+這裡的重頭戲在createSocket()函數的呼叫上，這個函數實際上呼叫了net.js中定義的建置函數createConnection()，這個函數的定義如下所示：
 
 ```js
 exports.connect = exports.createConnection = function () {
@@ -247,4 +247,63 @@ function connect(self, address, port, addressType, localAddress, localPort) {
 }
 ```
 
-self._handle是之前建立的TCP物件，在JavaScript層面呼叫connect()方法，會直接引起C++層面的TCPWrap::Connect方法的呼叫。到達這個函數之後，再繼續往下執行，則有關呼叫作業系統的API建立連接。
+self._handle是之前建立的TCP物件，在JavaScript層面呼叫connect()方法，會直接引起C++層面的TCPWrap::Connect方法的呼叫。到達這個函數之後，再繼續往下執行，則有關呼叫作業系統的API建立連接。這裡以Linux作業系統為例，Node使用Epoll處理非同步事件。下面簡要描述進入TCPWrap::Connect()函數之後的過程。大致分為四步：
+
+1. 建立一個非阻塞的socket
+2. 呼叫系統函數connect()
+3. 呼叫`uv_epoll_ctl()`將建立的非阻塞socket與一個已存在的Epoll的控制碼連接起來
+4. 呼叫`uv_epoll_wait()`函數，收集就緒的描述符號，然後執行對應的回呼函數
+
+前兩步表現在tcp.c的uv_tcp_connect函數中。第三、四步稍微複雜些，呼叫完uv_tcp_connect()之後，其實並未連接Epoll控制碼。第三、四步的操作在後一個執行緒循環中進行。實際程式在*linux-core.cc*的`uv_io_poll()`函數中。
+
+繼續，傳替connect()函數的第一個參數是TCPConnectWrap建置函數建立的req物件，此物件代表這次TCP連接階段。當連接過程結束，此物件的生命期也終結。這個物件的建置函數也是在C++檔案中定義的。這是因為這種物件未來要在C++層面存取，一些需要的特性必須在建置的時候設定，這就需要借助C++層面的建置函數實現。之後為這個req物件增加了oncomplete屬性，其值是一個名為afterConnect()的函數。傳給connect()方法的參數中沒有回呼函數，連接過程結束，JavaScript的程式是如何獲得通知？在上述的第四步中，回呼函數的呼叫堆疊最後會到達TCPWrap::AfterConnect()，這個函數中執行了下面的敘述：
+
+```
+req_wrap->MakeCallback(env->oncomplete_string(), arraysize(argv), argv);
+```
+
+env->oncomplete_string()代表的字串是oncomplete，這個呼叫實際上從C++層面呼叫了req物件的afterConnect()方法(此處req是建置函數TCPConnectWrap建立的物件)。因此afterConnect相當於回呼函數，該函數內部觸發connect事件。之前提到socket物件監聽了connect事件，因此一旦連接成功，此事件的回呼函數被呼叫。在該函數中，呼叫了`_flush`方法，用戶端開始向伺服器發送資料。至此為止，連接階段結束。
+
+從對連接階段的分析得知，Node實現非同步流程的基本方式是**從JavaScript程式發起請求，借助V8的程式設計介面，進入C++程式，使用作業系統提供的非同步程式設計機制，例如Linux下的Epoll，向作業系統發起非同步呼叫，然後立即傳回。**主線的訊息循環會呼叫`uv_io_poll()`函數，此函數的主要工作就是不斷收集已經處於就緒狀態的描述符號，順序呼叫對應的回呼函數，執行回呼函數會從C++回到上層JavaScript層面，最後呼叫對應的JavaScript版本的回呼函數。這樣一圈下來，邏輯閉合。
+
+#### 2. 請求與回應階段
+
+前面比較詳細介紹了TCP的連接過程。Node讀寫socket也是非同步方式，流程與上述類似。上面討論提到afterConnect()方法會觸發connect事件。此事件代表連接過程完成，客戶可以向socket寫資料了。socket物件建立之後，同時還監聽了data事件，其回呼函數是socketOnData()，此方法在*_http.client.js*中定義。伺服器發送過來的任何資料，都會觸發這個函數執行。傳輸層不考慮資料格式，對資料格式的解析應該在取得資料之後開始。我們看到socketOnData中呼叫了HTTP協定解析器，邊接收資料邊解析，如下所示：
+
+```js
+function socketOnData(d) {
+    var socket = this;
+    var req = this._httpMessage;
+    var parser = this.parser;
+    var ret = parser.execute(d);
+    // ...
+```
+
+parser是一個C++層面的建置函數建立的物件，相關原始程式在*node_http_parser.cc*中。解析的工作由C++的程式完成，parser物件的execute()方法對應於C++的Parser::Execut()函數。一旦伺服器的HTTP表頭解析完畢，會觸發parserOnIncomingClient函數的執行，此函數也定義在*_http.client.js*，這個函數會觸發response事件。以上程式在呼叫http.request()函數傳回後，監聽了此事件。在事件函數中，傳入的res物件又監聽了data和end事件，後續便可取得資料和獲得資料發送完畢的通知。
+
+#### 3. 結束階段
+
+如果HTTP請求標頭包含Connection:keep-alive(預設自動增加)，那麼當用戶端收到伺服器端的所有回應資料之後，與伺服器的socket連接仍然保持。此socket物件將快取在全域Agent物件的freeSockets中，下次請求相同的位址時，直接取用，節省DNS解析和連接伺服器的時間。
+
+### 本機磁碟I/O——多執行緒模擬
+
+在HTTP請求的實例中，我們看到Node的非同步呼叫，其背後的機制是Linux的Epoll。在Windows下，則是採用完成通訊埠(IOCP)。這兩種方式的共同點是沒有啟用任何其他的執行緒。首先，Node的C++程式在執行非同步請求時沒有建立執行緒，也沒有佔用執行緒池的資源；其次，使用Epoll或IOCP，沒有隱式地引起更多執行緒的建立，也不存在執行緒被阻塞等待I/O完成的情況，我們可以稱上述過程完全非同步。對於網路I/O是這樣，但對於本機的磁碟I/O，Node使用了不同的策略。與遠端呼叫相比，本機磁碟I/O具有不同的特點：
+
+1. 本機磁碟讀寫比網路請求快得多
+2. 磁碟檔案按塊存取，作業系統的快取機制使得順序讀寫檔案的效率極高
+3. 相對於同步的讀寫，完全非同步的處理流程複雜得多
+
+第三點，看之前TCP連接過程，應該會同意。但也許真正值得考慮的是第一和第二點。Node在非主執行緒中執行同步程式，用多執行緒的方式模擬出非同步的效果，以上述前兩點考慮，比起完全非同步為基礎的方案，
+效率應該不會低多少。除本機磁碟操作，第一個範例提到的非同步解析DNS也是如此。
+
+Linux下Node在啟動時，會維護一個執行緒池，Node使用這個執行緒池的執行緒，同步地讀寫檔案；而在Windows下，則利用IOCP的通知機制，把同步程式交給作業系統管理的執行緒池執行。
+
+為什麼Windows下，主執行緒的非同步呼叫都使用了IOCP的通知機制？怎麼區分完全非同步和模擬出的非同步？因為讀寫本地檔案時，是以同步的方式呼叫ReadFile或WriteFile這種API，執行緒會等待，直到I/O過程結束，才會執行下面的敘述。雖然這個過程沒有使用Node本身的執行緒池，但一樣會消耗作業系統執行緒池的資源。而對於socket I/O，主執行緒呼叫完這種函數會立即傳回，不存在執行緒因為等待I/O而無法處理其他工作的情況。
+
+## 事件驅動
+
+對Node來講，以http請求為例，JavaScript程式中出現的connect、data、end、close等事件，驅動著程式的執行。從真實的程式設計角度看，所謂的事件就是向作業系統發起非同步呼叫之後，在以後某個時刻，所期待的結果發生了，這便是一個事件。
+
+Node內建函數`uv_epoll_wait`收集所有就緒的事件，然後依次呼叫回呼函數。如果上層監聽了對應事件，則依次呼叫對應的事件函數。例如發起一個socket連接請求，當連接成功後，從C++進入到JavaScript層面後，會觸發connect事件，其事件函數被依次呼叫。因為JavaScript的閉包機制，呼叫之前的上下文依然保留，程式可以接著向下執行已經連接之後的邏輯。
+
+在同步與非同步的比較，我們討論了非同步程式設計的諸多好處，主要表現在節省CPU資源，不阻塞，快速，高回應。但還有一點沒有談到，就是非同步的編碼範式幾乎用不到**鎖**，這在C++層面由起表現出它的優勢。我們驚奇地發現，不僅所有JavaScript程式均執行於主執行緒，對於完全非同步的情況，C++程式也不需要使用鎖。因為所有程式也執行在主執行緒，物件內部狀態都在一個執行緒中保護。
