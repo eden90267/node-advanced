@@ -1,0 +1,11 @@
+verbose: false
+instrumentation:
+    root: .
+    default-excludes: true
+    excludes: []
+    include-all-sources: true
+reporting:
+    print: summary
+    reports:
+        - lcov
+    dir: ./coverage
