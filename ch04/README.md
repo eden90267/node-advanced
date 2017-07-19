@@ -9,7 +9,7 @@
 ```js
 (function () {
     console.log('hello world!');
-})();
+});
 ```
 
 在命令列下執行`node
