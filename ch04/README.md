@@ -158,3 +158,53 @@ Node.js模組可以分為3大類。
    執行到這裡，使用者的入口檔案開始載入。
 
 3. 使用者的JavaScript檔案以及NPM安裝的模組，根據上面的討論，這些指令檔模組對應Module建置出的物件。require函數由Module.prototype.require定義，載入之後模組快取在Module._cache。
+
+## 正確匯出模組
+
+使用module.export或exports都可以將一個檔案的函數或物件匯出。從建置函數Module可以看出，它們都指向同一個空白物件。因此以下程式完全相等：
+
+```js
+module.exports.IA = 'ia';
+exports.IA2 = 'ia';
+exports.IAF = function() {
+  console.log('');
+}
+```
+
+甚至可以直接使用this匯出：
+
+```js
+this.IA3 = 'ia';
+```
+
+以上程式都不改變exports的值，改變的是其指向的物件。但如果對exports設定值，如下所示：
+
+```js
+module.exports = {
+    print: function() {
+      console.log('');
+    }
+}
+```
+
+則只能使用module.exports匯出，如果exports前不加.module，module.exports指向的物件仍然是{}。
+
+## 小心使用全域變數
+
+把JavaScript檔案包裝成一個匿名函數執行，使得指令檔內部定義的變數侷限於函數內部，只有用exports匯出，外部才能存取。這使得不同檔案中，相同的變數名稱互不干擾。如果定義變數時，前面不加var，則變數為全域變數。Node的執行環境存在一個全域的物件global，它類似瀏覽器的window物件。如果程式按以下方式寫：
+
+```js
+function test() {
+    this.xxx = 'xxx';
+    yyy = 200;
+}
+test();
+```
+
+就會替global增加兩個屬性。
+
+```js
+console.log(global);
+```
+
+檢視這個全域物件包含哪些成員。
