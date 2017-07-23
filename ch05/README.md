@@ -162,3 +162,257 @@ JavaScript的物件在V8引擎的堆中建立，V8會自動回收不被參考的
 年輕分代的堆積空間一分為二，只有一半處於使用中，另外一半用於垃圾清理。年輕分代主要儲存於那些生命期短暫的物件，例如函數中的區域變數。它們類似C++中在堆疊上分配的物件，當函數傳回，呼叫堆疊中的區域變數都會被解構掉。V8瞭解記憶體的使用情況，當發現記憶體空間不夠，需要清理時，才進行回收。實際步驟是，將還被參考的物件複製到另一半的區域，然後釋放目前一半的空間，把目前被釋放的空間留作備用，兩者角色互換。年輕分代類似執行緒的堆疊空間，本身不會太大，佔用它空間的物件類似C++中的局部物件，生命週期非常短，因此大部分都是需要被清理掉的，需要複製的物件極少，雖然犧牲了部分記憶體，但速度極快。
 
 在C++程式中，當呼叫一個函數時，函數內部定義的局部物件會佔用堆疊空間，但函數巢狀結構總是有限的，隨著函數呼叫的結束，堆疊空間也被釋放掉。因此其執行過程中，堆疊猶如一個可伸長縮短的單眼鏡頭。而JavaScript程式的執行，因為物件使用的空間是在年輕分代中分配，當要在堆中分配而記憶體不夠時，由於新物件的擠壓，將超出生命期的垃圾物件清除出去，這個過程猶如在玩一種消除類遊戲。
+
+#### 2. 年老分代
+
+年老分代中的物件類似C++中使用new運算符號在堆中分配的物件。因為這種物件一般不會因為函數的退出而銷毀，因此生命期較長。年老分代的大小遠大於年輕分代。主要包含以下資料。
+
+1. 從年輕分代中移動過來的物件。
+2. JIT之後產生的程式
+3. 全域物件
+
+年老分代可用的空間要大許多，64位元為1.4GB、32位元為700MB。如果採用年輕分代一樣的清理演算法，浪費一般空間不說，複製大區塊物件在時間上也讓人難以忍受，因此必須採用新的方式。V8採用了**標記清除**和**標記整理**的演算法。其想法是將垃圾回收分為兩個過程，標記清除階段檢查堆中的所有物件，把有效的物件標記出來，之後清除垃圾物件。因為年老分代中需要回收的物件比例極小，所以效率教高。當執行完一次標記清除後，堆積記憶體變得不連續，記憶體碎片的存在使得不能有效使用記憶體。在後續的執行中，當遇到沒有一塊碎片記憶體能夠滿足申請物件需要的記憶體空間時，將觸發V8執行標記整理演算法。標記整理移動物件，緊縮V8的堆積空間，將碎片的記憶體整理為大區塊記憶體。實際上，V8執行這些演算法的時候，並不是一次性做完，而是走走停停，因為垃圾回收會阻塞JavaScript程式的執行，所以採取交替執行的方式，有效地減少了垃圾回收給程式造成的最大停頓時間。
+
+#### 3. 大物件空間
+
+大物件空間主要儲存需要較大記憶體的物件，也包含資料和JIT產生的程式。垃圾回收不會移動大物件，這部分記憶體使用的特點是，整塊分配，一次性整塊回收。
+
+### 使用Buffer
+
+Buffer使用堆外記憶體，當我們操作檔案，或發起網路請求，應該直接使用Buffer操作資料，而非將其轉成字串，這樣可以顯著提高效率。Buffer在堆外申請的空間釋放的時機是在Buffer物件被垃圾回收之時。我們不能決定V8什麼時候進行垃圾回收，因此在高平行處理使用Buffer的情景中，有可能造成Buffer維護的堆外記憶體遲遲無法釋放。這時可以考慮引用協力廠商模組，使得我們可以手動釋放Buffer的空間。
+
+Node目前使用的Buffer是以V8為基礎的Uint8Array類別，這個類別提供了將堆外記憶體的控制權交出的函數。可以很容易地實現手動釋放記憶體的需求。
+
+```c++
+#include <stdlib.h>
+#include <Node.h>
+#include <v8.h>
+#include <node_buffer.h>
+using v8::ArrayBuffer;
+using v8::HandleScope;
+using v8::Isolate;
+using v8::Local;
+using v8::Object;
+using v8::Value;
+using v8::Uint8Array;
+inline bool HasInstance(Local<Object> obj) {
+  return obj->IsUint8Array();
+}
+void Method (const v8::FunctionCallbackInfo<v8::Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HandleScope scope(isolate);
+  Local<Object> buf = args[0].As<Object>();
+  if (!HasInstance(buf))
+    return;
+  Local<Uint8Array> array = buf.As<Uint8Array>();
+  if (array->Buffer()->GetContents().ByteLength() <= 8 * 1024 || array->Buffer()->IsExternal())
+    return;
+  int64_t change_in_bytes = -static_cast<int64_t>(array->Buffer()->GetContents().ByteLength());
+  ArrayBuffer::Contents array_c = array->Buffer()->Externalize();
+  free(array_c.Data());
+  isolate->AdjustAmountOfExternalAllocatedMemory(change_in_bytes);
+}
+void init(v8::Local<v8::Object> exports, v8::Local<v8::Object> module) {
+  NODE_SET_METHOD(module, "exports", Method);
+}
+NODE_MODULE(binding, init);
+```
+
+上述程式直接匯出一個函數，這個函數接收一個Buffer物件。對於小於8KB的Buffer，它的記憶體可能來自Uint8Array的片段，因此不能簡單釋放。如果這個物件維護的推外記憶體大於8KB，就可以將記憶體釋放掉。而這行程式：
+
+```c++
+isolate->AdjustAmountOfExternalAllocatedMemory(change_in_bytes);
+```
+
+用來告知V8堆外記憶體已經改變了。傳入的change_in_bytes為負數，代表堆外記憶體減少了對應值。這個函數內部判斷了一下堆外記憶體是否超過一個固定值：
+
+```c++
+// I::kExternalAllocationLimit is const as (192 * 1024 * 1024)
+if (change_in_bytes > 0 &&
+    amount - *amount_of_external_allocated_memory_at_last_global_gc > I::kExternalAllocationLimit) {
+  ReportExternalAllocationLimitReached();
+}
+```
+
+可見，如果change_in_bytes為正，且堆外記憶體超過了這個固定值，就會呼叫V8內部的函數`ReportExternalAllocationLimitReached`。
+
+前面提到V8對堆積記憶體的垃圾回收演算法採取增量標記的方式進行，這個函數的作用正是為增量標記演算法的執行提供時機。也就是V8只需要標記相隔兩次呼叫之間的新增物件。這便將每次需要呼叫標記處理的物件個數減少了。
+
+### 避免記憶體洩漏
+
+假設程式中需要一個佇列，以生產者消費者的方式處理元素，我們可能會撰寫一個類似以下的佇列類別：
+
+```js
+"use strict"
+const MAXLEN = 2000;
+class Queue {
+    constructor() {
+        this.filelist = [];
+        this.top = 0;
+    }
+    Push(path) {
+        this.filelist.push(path);
+    }
+    Pop() {
+        if (this.top < this.filelist.length){
+            if (this.top > 32) {
+                this.filelist = this.filelist.splice(this.top, this.filelist.length - this.top);
+                this.top = 0;
+            }
+            this.top += 1;
+            return this.filelist[this.top - 1];
+        } else {
+            return null;
+        }
+    }
+}
+```
+
+假如上述程式呼叫Pop()的頻率更高，那不會出現什麼問題，但如果Push()的操作頻率高於Pop()，那麼佇列就會不斷膨脹。因此，上述佇列是不安全的。我們可以替類別增加一個成員變數：
+
+```js
+"use strict"
+const MAXLEN = 2000;
+class Queue {
+    constructor() {
+        this.filelist = [];
+        this.top = 0;
+    }
+    Push(path) {
+        this.filelist.push(path);
+    }
+    Pop() {
+        if (this.top < this.filelist.length){
+            if (this.top > 32) {
+                this.filelist = this.filelist.splice(this.top, this.filelist.length - this.top);
+                this.top = 0;
+            }
+            this.top += 1;
+            return this.filelist[this.top - 1];
+        } else {
+            return null;
+        }
+    }
+    Shuff() {
+        if ((this.filelist.length - this.top) > MAXLEN) {
+            this.filelist = this.filelist.splice(this.top, MAXLEN - 700);
+            this.top = 0;
+        }
+    }
+}
+```
+
+我們可以在呼叫Pop()方法之後，呼叫一次Shuff()方法。如果發現佇列超過一定大小，將一部分資料刪除。除此之外，應該考慮借助Redis或Kafka實現生產者消費者佇列。
+
+>**Tips**：  
+>Redis和Kafka的區別如下。
+>
+>Redis是一個以**記憶體為基礎**的Key-Value儲存系統。Redis提供了豐富的資料結構，包含lists、sets、ordered sets、hashes以及對這些資料結構操作的API。ioredis是一個知名的Redis用戶端，它的特點如下。
+>
+>支援Cluster(叢集模式)、Sentinel(檢查點)、Pipelining、Lua指令搞和二進位訊息的發布訂閱；
+
+>- 非常好用的API，支援Promise和ES6 Generator
+>- 可以與C模組 Hiredis 一同使用
+>- 支援對參數和傳回值自訂形式轉換函數
+>- 允許使用者自訂指令
+>- 支援二進位資料
+>- 提供交易支援
+>- 對key透明地增加字首，方便管理鍵的命名空間
+>- 自動重連機制
+>- 支援TLS、離線佇列，ES6標準的類型如Set和Map
+
+下面是利用Redis作佇列的實例：
+
+```js
+var Redis = require('ioredis');
+var redis = new Redis({
+    port: 6379,
+    host: '127.0.0.1'
+});
+const QUEUENAME = 'data_mq';
+redis.rpush(QUEUENAME, 'Electric cars will be popular');
+redis.lpop(QUEUENAME, function(err, data) {
+  console.log(data);
+})
+```
+
+ioredis支援叢集模式，使用起來和單機模式沒有太大區別，以下是一個連接叢集的實例。
+
+```js
+var Redis = require('ioredis');
+// cluster mode
+var redis_cluster = new Redis.Cluster([{
+    port: port1,
+    host: 'ip1'
+}, {
+    port: port2,
+    host: 'ip2'
+}], {
+    redisOptions: {
+        dropBufferSupport: true,
+        parser: 'hiredis'
+    }
+});
+redis_cluster.multi().set('foo', 'xbar').get('foo').exec(function(err, results) {
+  console.log(results);
+});
+```
+
+這裡連接了一個Redis叢集，並指定使用Hiredis(須先安裝這個模組)。Hiredis是一個用C語言實現的Redis協定解析器，對於像get或set這種簡單的操作，使用ioredis附帶的JavaScript版的解析器就足夠了。但對於lrange或ZRANGE這種可能傳回巨量資料的操作，使用Hiredis效果顯著
+
+ioredis為每一個指令提供了一個二進位版本，用以操作二進位資料。例如lpop的二進位版本是lpopBuffer，它傳回Buffer類型的物件。
+
+```js
+redis.lpopBuffer(QUEUENAME, function(err, data) {
+  console.log(data instanceof Buffer);
+});
+```
+
+`console.log`將列印出true。
+
+dropBufferSupport選項設置為true，表示ioredis將強制解析器傳回字串而非Buffer物件。這個選項預設為false，在使用Hiredis時，應該為true，以避免不必要的記憶體複製，否則會影響GC的效能。如果要使用二進位版本的指令，可以再建立一個使用預設協定解析氣的連接實例。
+
+上述範例以交易的方式呼叫set和get。在叢集模式下，交易內部的操作只能夠在相同的key上進行。
+
+關於ioredis的更多說明和使用實例：[https://github.com/luin/ioredis](https://github.com/luin/ioredis)。
+
+Kafka是一個以**磁碟儲存為基礎**的、分散式發布訂閱訊息系統，可支援每秒數百萬等級的訊息。它的特點是每次向磁碟檔案尾端追加內容，不支援隨機讀寫，以O(1)的磁碟讀寫提供訊息持久化。Kafka還可用來集中收集紀錄檔，Node程式以非同步方式將記錄檔發送到Kafka叢集中，而非儲存到本機或資料庫。這樣consumer端可以方便地使用hadoop技術堆疊進行資料採擷和演算法分析。kafka-node是一個Node用戶端，它的安裝和使用，可參考：[https://github.com/SOHU-Co/kafka-node](https://github.com/SOHU-Co/kafka-node)。
+
+JavaScript的閉包機制使得被非同步呼叫打斷的邏輯，在等待非同步完成的過程中，上下文環境仍能夠保留。非同步呼叫完成後，回呼函數可以在它需要的上下文環境中繼續執行。閉包的這個特點，使得它可以參考它之外的自由變數。一個函數執行完畢，其內部變數應該可以被回收。但閉包的參考，使這個問題變得稍微複雜一些。如果被閉包參考，而這個閉包又在有效期內，則這些變數不會被回收。例如：
+
+```js
+function CreatePerson(name) {
+    var o = {
+        sayName: function() {
+          console.log(_name);
+        }
+    }
+    var _name = name;
+    return o;
+}
+var friend = CreatePerson('li');
+friend.sayName();
+```
+
+我們透過建置函數建立的friend物件是一個閉包，這個閉包參考了建置函數中的_name變數，這個變數不會被釋放，除非將friend設定值為null。而下面的實例。
+
+```js
+var clo = function() {
+  var largeArr = new Array(1000);
+  return function() {
+    console.log('run once');
+    return largeArr;
+  }
+}();
+setTimeout(clo, 2000);
+clo = null;
+```
+
+執行等待2秒之後，列印出run
+once。雖然立即將clo設定值為null，但是物件不會被釋放。setTimeout相當於發起一次非同步請求，這個非同步請求2秒之後結束，回呼正是col原來參考的閉包。
+
+Node執行過程中，只要滿則以下三項中的任意一項，物件均不會被回收：
+
+1. 全域變數或由全域變數出發，可以存取到的物件
+2. 正執行函數中的局部物件，包含這些局部物件可以存取到的物件
+3. 一個非全域物件，如果被一個閉包參考，則這個物件將和參考的閉包一同存在，即使離開了建立它的環境。這個物件稱為自由變數，它為未來閉包執行的時候保留上下文環境。
