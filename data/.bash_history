@@ -35,3 +35,31 @@ ls
 cd book/
 sl
 ls
+ls
+cd /root/
+ls
+cd book/
+ls
+node -v
+node 7-2.js 
+ls
+node 7-2.js 
+npm -v
+npm i node-threadobject --save
+node 7-2.js 
+node 7-2.js 
+exit
+cd /root/book/
+ls
+./gulpmon.sh 
+./gulpmon.sh 
+ls
+gulp test
+./gulpmon.sh 
+gulp test
+ls
+node pyield-sample.js 
+redis
+redis-cli
+gulp test
+exit
