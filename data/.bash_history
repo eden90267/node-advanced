@@ -63,3 +63,7 @@ redis
 redis-cli
 gulp test
 exit
+cd /root/book/
+ls
+gulp
+exit

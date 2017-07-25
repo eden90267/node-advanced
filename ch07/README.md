@@ -258,3 +258,204 @@ console.log('hco end');
 ```
 
 Promise.all函數接收一個陣列，這個陣列每一個物件都是Promise實例，這些Promise物件被同時發起，達到平行效果。
+
+## 嚴格模式下執行
+
+之前執行導案前都透過gulp工具將ES6程式先轉為ES5。隨著ES6標準的發佈和Node本身的發展，Node已經可以原生支援ES6標準，包含Generator和yield。執行前不是必須先執行gulp，在JavaScript檔案最開始，增加以下程式：
+
+```js
+"use strict";
+```
+
+告訴Node以嚴格模式執行程式，然後刪除對babel-polyfill模組的參考。
+
+```js
+"use strict";
+let Promise = require('bluebird');
+let co = Promise.coroutine;
+// ...
+```
+
+gulp之後產生的檔案，最前面也有以下敘述：
+
+```js
+"use strict";
+```
+
+嚴格模式消除了之前語法的不嚴謹、不合理的地方，同時也有助解譯器更快地執行我們的程式。
+
+## 了解執行過程
+
+上面的一些程式實例，被co套件起來的部分稱為Generator，它是以以下形式定義的函數：
+
+```js
+"use strict";
+function* gen() {
+  yield 'hello world!';
+}
+```
+
+執行這個函數會產生一個Generator實例，它的特點是每次執行到yield右側的運算式就不再繼續往下執行。如果要繼續，需要人為地呼叫一次物件的next()方法。next()方法傳回一個物件，其中一個屬性value儲存著yield右側運算式的值。對於剛產生的Generator物件，不會執行任何敘述。因此第一次呼叫next()之後，執行到第一個yield右側的運算式，next()傳回的物件中包含第一個yield右側運算式的值。例如下面的實例：
+
+```js
+"use strict";
+let iter = (function* () {
+    yield "hello world";
+})();
+console.log(iter.next());
+```
+
+執行這個檔案，列印結果如下：
+
+```sh
+{ value: 'hello world', done: false }
+```
+
+done代表是否執行完畢。如果將某一個物件作為參數呼叫next()方法，則yield左側的運算式被這個物件設定值。
+
+我們熟悉了Generator物件的這種執行方式後，可以設想，使用Generator將非同步流程寫成同步的形式，呼叫next()方法的時機就是回呼函數執行的當口。因為這時候回呼函數接收到的衫既漚是這次非同步呼叫後的結果。將這個結果作為參數呼叫next()，則我們的程式中"yield"左側的變數就被正確設定值，同時開始執行下一個非同步作業。
+
+採用這種方式，從上到下，直到這個Generator物件中被yield分割的每一個部分都執行完畢。
+
+在上面的範例中，使用yield發起的非同步呼叫，我們沒有傳入回呼函數，而是事先用bluebird函數庫的Promise.promisify做了一個處理。Promise.promisify以一個非同步函數作為參數，傳回對應的Promise版本的物件。上節我們提到Promise實例有一個then()方法，呼叫then()方法，開始執行非同步作業，而傳給then()方法的函數用來收集結果。當這個收集函數被呼叫時，代表著非同步過程結束，正好可以趁機呼叫Generator物件的next()方法。
+
+下一步，我們來實現一個以Generator為基礎的將非同步改造為同步形式的擴至函數co()，不依賴bluebird，_co.js_：
+
+```js
+"use strict";
+// co.js
+module.exports = function (gen) {
+    var hander_error_ = [];
+
+    function flow() {
+        var iter_ = gen();
+        var next_ = (data) => {
+            var result = iter_.next(data);
+            if (!result.done) {
+                result.value.then((data) => {
+                    next_(data);
+                }).catch(function (err) {
+                    hander_error_.forEach((handler) => {
+                        if (typeof handler == 'function') {
+                            handler(err);
+                        }
+                    });
+                });
+            }
+        };
+        process.nextTick(() => {
+            try {
+                next_();
+            } catch (err) {
+                hander_error_.forEach((handler) => {
+                    if (typeof handler == 'function') {
+                        handler(err);
+                    }
+                });
+            }
+        });
+        return flow;
+    }
+
+    Object.defineProperty(flow, 'catch', {
+        enumerable: false,
+        value: function (handler) {
+            if (typeof handler == 'function') {
+                hander_error_.push(handler);
+            }
+            return flow;
+        }
+    });
+    return flow;
+};
+```
+
+上述程式的流程控制函數由我們自己實現，接下來可以撰寫一個使用co.js模組的實例，_test_co.js_：
+
+```js
+"use strict";
+// test_co.js
+let fs = require('fs');
+let co = require('./co');
+let readdirAsync = (dirname) => {
+    return new Promise((resolve, reject) => {
+        fs.readdir(dirname, function (err, data) {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(data);
+            }
+        });
+    });
+};
+let delayBySecAsync = (secs) => {
+    return new Promise((resolve, reject) => {
+        setTimeout(function () {
+            resolve();
+        }, secs * 1000);
+    });
+};
+let hco = co(function* () {
+    console.log('co begin');
+    console.log('Wait by 1 sec, then print current directory');
+    yield delayBySecAsync(1);
+    let ret = yield readdirAsync(__dirname);
+    console.log(ret);
+    throw new Error('An error has been intentionally throwed');
+    console.log('co end');
+});
+hco().catch(function (e) {
+    console.error(e);
+});
+```
+
+以上程式參考了co.js，其他部分的程式與使用bluebird的coroutine時大同小異。執行上面程式：
+
+```sh
+$ docker exec fc7 sh -c "node /root/book/ES6/test_co.js"
+co begin
+Wait by 1 sec, then print current directory
+[ 'co.js',
+  'first_es6.js',
+  'pyield-sample.js',
+  'pyield.js',
+  'sec_es6.js',
+  'test_co.js',
+  'thi_es6.js' ]
+[Error: An error has been intentionally throwed]
+```
+
+上述的流程控制函數考慮了例外處理，test_co.js中的敘述：
+
+```js
+throw new Error('An error has been intentionally throwed');
+```
+
+故意拋出了一個例外，因此未執行console.log('co
+end')，而是跳耀度註冊的例外處理函數。接下來，我們使用bluebird函數庫實現相同功能，對照來看：
+
+```js
+"use strict";
+// test_co.js
+let fs = require('fs');
+let Promise = require('bluebird');
+var Thread = require('node-threadobject');
+var co = Promise.coroutine;
+var thread = new Thread();
+let readdirAsync = Promise.promisify(fs.readdir, fs);
+let delayBySecAsync = Promise.promisify(thread.delayBySec, thread);
+let hco = co(function* () {
+    console.log('co begin');
+    console.log('Wait by 1 sec, then print current directory');
+    yield delayBySecAsync(1);
+    let ret = yield readdirAsync(__dirname);
+    console.log(ret);
+    throw new Error('An error has been intentionally throwed');
+    console.log('co end');
+});
+hco().catch(function (e) {
+    console.error(e);
+});
+```
+
+Promise.coroutine實現了流程控制的功能，Promise.promisify將非同步函數轉換成Promise物件。現在，讀者應該能體會bluebird這個Promise函數庫是多麼強大了。
